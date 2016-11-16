@@ -5,11 +5,13 @@ import * as vinylfs from 'vinyl-fs';
 import * as gutil from 'gulp-util';
 import * as through from 'through';
 import * as ts from 'typescript';
+
 import {createTypeScriptBuilder, CancellationToken, IConfiguration, ITypeScriptBuilder, getTypeScript} from './builder';
 import {Transform} from 'stream';
 import {existsSync} from 'fs';
 import {dirname, resolve, sep, join, relative, isAbsolute} from 'path';
-import {strings, collections} from './utils';
+import {strings, collections, SerializedVinyl, deserializeVinyl, serializeVinyl} from './utils';
+import {fork} from 'child_process';
 const assign: typeof Object.assign = Object.assign || require('es6-object-assign').assign;
 
 declare module "through" {
@@ -18,51 +20,66 @@ declare module "through" {
     }
 }
 
-declare module "stream" {
-    interface ReadableOptions {
-        read?(size: number): void;
-    }
+export interface IVinylDestOptions {
+    /** Specify the working directory the folder is relative to
+     * Default is process.cwd()
+     */
+    cwd?: string;
+
+    /** Specify the mode the files should be created with
+     * Default is the mode of the input file (file.stat.mode)
+     * or the process mode if the input file has no mode property
+     */
+    mode?: number|string;
+
+    /** Specify the mode the directory should be created with. Default is the process mode */
+    dirMode?: number|string;
+
+    /** Specify if existing files with the same path should be overwritten or not. Default is true, to always overwrite existing files */
+    overwrite?: boolean;
 }
 
-declare module "vinyl-fs" {
-    interface IDestOptions {
-        /** Specify the working directory the folder is relative to
-         * Default is process.cwd()
-         */
-        cwd?: string;
-
-        /** Specify the mode the files should be created with
-         * Default is the mode of the input file (file.stat.mode)
-         * or the process mode if the input file has no mode property
-         */
-        mode?: number|string;
-
-        /** Specify the mode the directory should be created with. Default is the process mode */
-        dirMode?: number|string;
-
-        /** Specify if existing files with the same path should be overwritten or not. Default is true, to always overwrite existing files */
-        overwrite?: boolean;
-    }
-
-    interface IWatchOptions {
-        interval?: number;
-        debounceDelay?: number;
-        cwd?: string;
-        maxListeners?: Function;
-    }
-
-    interface IWatchEvent {
-        type: any;
-        path: any;
-        old: any;
-    }
-
-    type WatchCallback = (outEvt: IWatchEvent) => void;
-}
 
 export interface IncrementalCompiler {
     (): Transform;
 }
+
+interface ConfigMessage {
+    kind: string; //'config';
+    config: IConfiguration;
+    compilerOptions: ts.CompilerOptions;
+}
+
+interface FileMessage {
+    kind: string; //'file';
+    file: SerializedVinyl;
+}
+
+interface BuildMessage {
+    kind: string; //'build';
+}
+
+interface CloseMessage {
+    kind: string; //'close';
+}
+
+interface ErrorMessage {
+    kind: string; //'error';
+    message: string;
+}
+
+interface OutputMessage {
+    kind: string; //'output';
+    file: SerializedVinyl;
+}
+
+interface EndOfOutputMessage {
+    kind: string; //'end-of-output';
+    value: any;
+}
+
+type IPCParentMessage = ConfigMessage | FileMessage | BuildMessage | CloseMessage;
+type IPCChildMessage = ErrorMessage | OutputMessage | EndOfOutputMessage;
 
 export class IncrementalCompiler {
     private _onError: (message: any) => void;
@@ -88,6 +105,7 @@ export class IncrementalCompiler {
         if (!this._project) {
             return [];
         }
+
 
         // we do not cache file names between calls to .src() to allow new files to be picked up by
         // the compiler between compilations.  However, we will cache the compiler options if we
@@ -164,8 +182,50 @@ export class IncrementalCompiler {
         };
     }
 
+    private _createBuilderProxy(): ITypeScriptBuilder {
+        const child = fork(join(__dirname, './index.js'));
+        let outputCb: (file: Vinyl) => void = () => {};
+        let errorCb: (err: any) => void = () => {};
+        let completionPromise: Promise<any>;
+        let resolveFunction: (data: any) => void = () => {};
+        let rejectFunction: (err: any) => void = () => {};
+
+        child.on('message', (data: IPCChildMessage) => {
+            switch (data.kind) {
+                case 'end-of-output':
+                resolveFunction((data as EndOfOutputMessage).value); // Signal end of stream
+                child.unref(); // Unref the child so the parent process can die (and then let the child die)
+                break;
+                case 'output':
+                outputCb(deserializeVinyl((data as OutputMessage).file));
+                break;
+                case 'error':
+                errorCb((<ErrorMessage>data).message);
+                break;
+            }
+        });
+        child.send({kind: 'config', config: this._config, compilerOptions: this.compilerOptions});
+
+        return {
+            build: (outcb, errcb): Promise<any> => {
+                (child as any).ref(); // We have to keep the ref until the build is done if we're unreffed
+                outputCb = outcb;
+                errorCb = errcb;
+                completionPromise = new Promise((resolve, reject) => {
+                    resolveFunction = resolve;
+                    rejectFunction = reject;
+                });
+                child.send({kind: 'build'});
+                return completionPromise;
+            },
+            file: (file) => {
+                child.send({kind: 'file', file: serializeVinyl(file)});
+            }
+        }
+    }
+
     private get builder() {
-        return this._builder || (this._builder = createTypeScriptBuilder(this._config, assign({}, this.compilerOptions)));
+        return this._builder || (this._builder = this._config.parallel ? this._createBuilderProxy() : createTypeScriptBuilder(this._config, Object.assign({}, this.compilerOptions)));
     }
 
     /**
@@ -317,7 +377,7 @@ export class IncrementalCompiler {
      *
      * @param options Options to pass to vinyl-fs.
      */
-    public dest(options?: vinylfs.IDestOptions) {
+    public dest(options?: IVinylDestOptions) {
         return vinylfs.dest(this.destPath, options);
     }
 
@@ -366,6 +426,8 @@ export interface CreateOptions {
     typescript?: typeof ts;
     /** The base path to use for file resolution. */
     base?: string;
+    /** Indicates whether to run the build in a seperate process. */
+    parallel?: boolean;
     /** Custom callback used to report compiler diagnostics. */
     onError?: (message: any) => void;
 }
@@ -414,6 +476,7 @@ export function create(projectOrCompilerOptions: CompilerOptions | string, verbo
     let verbose: boolean | undefined;
     let typescript: typeof ts | undefined;
     let base: string | undefined;
+    let parallel: boolean | undefined = false;
     if (typeof verboseOrCreateOptions === "boolean") {
         verbose = verboseOrCreateOptions;
     }
@@ -423,11 +486,13 @@ export function create(projectOrCompilerOptions: CompilerOptions | string, verbo
         onError = verboseOrCreateOptions.onError;
         typescript = verboseOrCreateOptions.typescript;
         base = verboseOrCreateOptions.base;
+        parallel = verboseOrCreateOptions.parallel;
     }
     json = !!json;
     verbose = !!verbose;
+    parallel = !!parallel;
 
-    const config: IConfiguration = { json, verbose, noFilesystemLookup: false };
+    const config: IConfiguration = { json, verbose, parallel, noFilesystemLookup: false };
     if (typescript) config.typescript = typescript;
     if (base) config.base = resolve(base);
 
@@ -438,3 +503,30 @@ export function create(projectOrCompilerOptions: CompilerOptions | string, verbo
         return IncrementalCompiler.fromOptions(projectOrCompilerOptions, config, onError);
     }
 }
+
+let _childProcessBuilder: ITypeScriptBuilder | undefined;
+
+process.on('message', (data: IPCParentMessage) => {
+    switch (data.kind) {
+        case 'config':
+        _childProcessBuilder = createTypeScriptBuilder((<ConfigMessage>data).config, (<ConfigMessage>data).compilerOptions);
+        break;
+        case 'file':
+        if (!_childProcessBuilder) return process.send!({kind: 'error', message: 'config message never received'});
+        _childProcessBuilder.file(deserializeVinyl((data as FileMessage).file));
+        break;
+        case 'build':
+        if (!_childProcessBuilder) return process.send!({kind: 'error', message: 'config message never received'});
+        _childProcessBuilder.build(
+            file => process.send!({kind: 'output', file: serializeVinyl(file)}),
+            message => process.send!({kind: 'error', message})
+        ).then(value => process.send!({kind: 'end-of-output', value}));
+        break;
+        case 'close':
+        process.exit(0);
+    }
+});
+
+process.on('disconnect', () => {
+    _childProcessBuilder = undefined;
+});

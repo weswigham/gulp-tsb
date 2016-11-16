@@ -26,6 +26,8 @@ export interface IConfiguration {
     typescript?: typeof ts;
     /** Indicates the base path from which a project was loaded or compilation was started. */
     base?: string;
+    /** Indicates whether to run the build in a seperate process. */
+    parallel: boolean;
     _emitWithoutBasePath?: boolean;
     _emitLanguageService?: boolean;
 }
@@ -541,7 +543,7 @@ class ScriptSnapshot implements ts.IScriptSnapshot {
 
     constructor(file: VinylFile) {
         this._file = file;
-        this._text = file.contents.toString("utf8");
+        this._text = file.contents.toString();
         this._mtime = file.stat.mtime;
     }
 
